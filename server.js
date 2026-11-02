@@ -94,12 +94,42 @@ async function resolverRemetente(msg) {
     }
   } catch (_) { /* versão sem lidMapping */ }
 
-  try {
-    const meta = await sock.groupMetadata(groupJid);
-    guardarParticipantes(meta.participants);
-  } catch (_) { /* segue para o fallback */ }
+  const agora = Date.now();
+  if (agora - (lidTentativas.get(lidKey(lid)) || 0) > 10 * 60 * 1000) {
+    lidTentativas.set(lidKey(lid), agora);
+    try {
+      const meta = await sock.groupMetadata(groupJid);
+      guardarParticipantes(meta.participants);
+    } catch (_) { /* segue para o fallback */ }
+  }
 
   return lidParaTelefone.get(lidKey(lid)) || null;
+}
+
+// ---- Vínculo LID -> usuário, aprendido uma vez e guardado no Supabase (tabela lid_usuarios) ----
+const lidUsuario = new Map();   // "219228300943587@lid" -> usuarios.id
+const pendentes = new Map();    // lidKey -> { msg, midia } aguardando o remetente se identificar
+const lidTentativas = new Map(); // lidKey -> timestamp da última consulta aos metadados do grupo
+
+const lidDoRemetente = (msg) =>
+  [msg.key.participantPn, msg.key.participantAlt, msg.key.senderPn, msg.participant, msg.key.participant]
+    .filter(Boolean)
+    .find(isLid);
+
+async function carregarLidUsuarios() {
+  const { data, error } = await supabase.from('lid_usuarios').select('lid,usuario_id');
+  if (error) return console.log('⚠️ Tabela lid_usuarios indisponível (rode o SQL novo do schema.sql):', error.message);
+  for (const r of data) lidUsuario.set(lidKey(r.lid), r.usuario_id);
+  console.log(`🔗 ${data.length} vínculo(s) de ID do WhatsApp carregado(s).`);
+}
+
+let usuariosCache = { at: 0, data: [] };
+async function getUsuarios() {
+  if (Date.now() - usuariosCache.at < 60_000 && usuariosCache.data.length) return usuariosCache.data;
+  const { data, error } = await supabase.from('usuarios').select('*');
+  if (error) throw error;
+  usuariosCache = { at: Date.now(), data };
+  return data;
 }
 
 // Aceita imagem e PDF. Devolve null para qualquer outro tipo de mensagem.
@@ -324,6 +354,7 @@ async function iniciarWhatsApp() {
       currentQR = null;
       whatsappConectado = true;
       console.log('✅ WhatsApp conectado.');
+      await carregarLidUsuarios();
       const jid = await resolverGrupo().catch(() => null);
       console.log(jid ? `👥 Grupo "${WHATSAPP_GROUP_NAME}" encontrado.` : `⚠️ Grupo "${WHATSAPP_GROUP_NAME}" não encontrado. O número pareado precisa estar nele.`);
     }
@@ -351,25 +382,58 @@ async function iniciarWhatsApp() {
 
         const content = baileys.normalizeMessageContent(msg.message);
         const midia = extrairMidia(content);
-        if (!midia) continue;
+        const texto = content?.conversation || content?.extendedTextMessage?.text || '';
+        // "sou Alfredo" / "sou a Fernanda": usado só para vincular um ID desconhecido a um usuário.
+        const reivindicacao = norm(texto).match(/^(?:eu\s+)?sou\s+(?:o\s+|a\s+)?([a-z]+)\s*[.!]?$/);
+        if (!midia && !reivindicacao) continue;
 
+        const usuarios = await getUsuarios();
         const tel = await resolverRemetente(msg);
-        if (!tel) {
-          console.log('Mídia ignorada: não foi possível descobrir o telefone do remetente.', {
-            participant: msg.key.participant,
-            participantPn: msg.key.participantPn,
-            participantAlt: msg.key.participantAlt,
-          });
+        const lid = lidDoRemetente(msg);
+
+        let usuario = tel ? usuarios.find((u) => phoneKey(u.telefone_whatsapp) === phoneKey(tel)) : null;
+        if (!usuario && lid) usuario = usuarios.find((u) => u.id === lidUsuario.get(lidKey(lid)));
+
+        if (usuario) {
+          if (midia) await processarMidia(msg, usuario, midia, baileys);
           continue;
         }
 
-        const { data: usuarios } = await supabase.from('usuarios').select('*');
-        const usuario = usuarios?.find((u) => phoneKey(u.telefone_whatsapp) === phoneKey(tel));
-        if (!usuario) {
-          console.log(`Mídia ignorada: telefone ${tel} não está cadastrado.`);
+        if (!lid) {
+          console.log(`Mensagem ignorada: remetente ${tel ? `com telefone ${tel} não cadastrado` : 'não identificado'}.`);
           continue;
         }
-        await processarMidia(msg, usuario, midia, baileys);
+
+        const nomes = usuarios.map((u) => `"sou ${u.nome.split(' ')[0]}"`).join(' ou ');
+
+        if (reivindicacao) {
+          const alvo = usuarios.find((u) => norm(u.nome).split(' ')[0] === reivindicacao[1]);
+          if (!alvo) {
+            await sock.sendMessage(groupJid, { text: `Não conheço "${reivindicacao[1]}". Responda ${nomes}.` }, { quoted: msg });
+            continue;
+          }
+          lidUsuario.set(lidKey(lid), alvo.id);
+          const { error } = await supabase.from('lid_usuarios').upsert({ lid: lidKey(lid), usuario_id: alvo.id });
+          if (error) console.log('⚠️ Vínculo não salvo no banco (vale só até reiniciar):', error.message);
+          await sock.sendMessage(groupJid, { text: `✅ Combinado, ${alvo.nome.split(' ')[0]}! Guardei seu ID, não precisa repetir.` }, { quoted: msg });
+          const pend = pendentes.get(lidKey(lid));
+          if (pend) {
+            pendentes.delete(lidKey(lid));
+            await processarMidia(pend.msg, alvo, pend.midia, baileys);
+          }
+          continue;
+        }
+
+        // Arquivo de alguém ainda não identificado: guarda e pede identificação (uma vez).
+        const jaPediu = pendentes.has(lidKey(lid));
+        pendentes.set(lidKey(lid), { msg, midia });
+        if (!jaPediu) {
+          await sock.sendMessage(
+            groupJid,
+            { text: `👋 Não consegui identificar quem enviou esse arquivo. Responda ${nomes} que eu registro agora (só precisa fazer isso uma vez).` },
+            { quoted: msg }
+          );
+        }
       } catch (err) {
         console.error('Erro na mensagem:', err);
       }
