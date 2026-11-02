@@ -3,6 +3,7 @@ const path = require('path');
 const express = require('express');
 const cron = require('node-cron');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const pino = require('pino');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenAI } = require('@google/genai');
@@ -14,6 +15,7 @@ const {
   WHATSAPP_GROUP_NAME = 'F&A Finanças',
   TZ_APP = 'America/Fortaleza',
   PORT = 3000,
+  QR_TOKEN,
 } = process.env;
 
 for (const [k, v] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY })) {
@@ -29,6 +31,8 @@ const logger = pino({ level: 'silent' });
 
 let sock = null;
 let groupJid = null;
+let currentQR = null; // último QR gerado pelo Baileys (null quando não há pareamento pendente)
+let whatsappConectado = false;
 
 // ---------- utilidades ----------
 const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
@@ -234,15 +238,20 @@ async function iniciarWhatsApp() {
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      console.log('\n📱 Escaneie o QR Code com o WhatsApp (Aparelhos conectados > Conectar um aparelho):\n');
+      currentQR = qr;
+      whatsappConectado = false;
+      console.log('\n📱 Novo QR Code gerado. Abra a rota /qr no navegador para escanear (ou use o QR abaixo):\n');
       qrcode.generate(qr, { small: true });
     }
     if (connection === 'open') {
+      currentQR = null;
+      whatsappConectado = true;
       console.log('✅ WhatsApp conectado.');
       const jid = await resolverGrupo().catch(() => null);
       console.log(jid ? `👥 Grupo "${WHATSAPP_GROUP_NAME}" encontrado.` : `⚠️ Grupo "${WHATSAPP_GROUP_NAME}" não encontrado. O número pareado precisa estar nele.`);
     }
     if (connection === 'close') {
+      whatsappConectado = false;
       const code = lastDisconnect?.error?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
         console.log('🚪 Sessão encerrada. Apague a pasta auth_info e reinicie para parear de novo.');
@@ -314,6 +323,44 @@ cron.schedule('0 21 * * *', enviarResumoDiario, { timezone: TZ_APP });
 // ---------- Servidor web (serve o PWA) ----------
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Página com o QR Code de pareamento do WhatsApp (atualiza sozinha a cada 5 s).
+// Se QR_TOKEN estiver definido no ambiente, acesse /qr?token=SEU_TOKEN.
+app.get('/qr', async (req, res) => {
+  if (QR_TOKEN && req.query.token !== QR_TOKEN) return res.status(401).send('Não autorizado.');
+  res.set('Cache-Control', 'no-store');
+
+  const page = (body, refresh) => `<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+${refresh ? '<meta http-equiv="refresh" content="5">' : ''}
+<title>F&A Finanças - QR Code</title>
+<style>
+  *{border-radius:0!important;box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0A0A0A;color:#EDEDED;font-family:'Courier New',monospace;text-align:center;padding:16px}
+  main{max-width:420px;width:100%;background:#161616;border:1px solid #333;padding:24px}
+  h1{font-size:18px;margin:0 0 16px}
+  img{display:block;width:100%;max-width:320px;margin:0 auto 16px;background:#fff;image-rendering:pixelated}
+  p{margin:0;color:#8A8A8A;font-size:13px;line-height:1.5}
+</style></head><body><main>${body}</main></body></html>`;
+
+  if (whatsappConectado) {
+    return res.send(page('<h1>✅ WhatsApp conectado</h1><p>Não é preciso escanear nada.</p>', false));
+  }
+  if (!currentQR) {
+    return res.send(page('<h1>Aguardando QR Code…</h1><p>Um novo código aparece em instantes. A página atualiza sozinha.</p>', true));
+  }
+  try {
+    const img = await QRCode.toDataURL(currentQR, { width: 320, margin: 2, errorCorrectionLevel: 'M' });
+    res.send(page(
+      `<h1>Escaneie com o WhatsApp</h1><img src="${img}" alt="QR Code do WhatsApp"><p>WhatsApp &gt; Aparelhos conectados &gt; Conectar um aparelho. O código troca a cada ~20 s e esta página atualiza sozinha.</p>`,
+      true
+    ));
+  } catch (err) {
+    console.error('Erro ao gerar imagem do QR:', err);
+    res.status(500).send('Erro ao gerar o QR Code.');
+  }
+});
 app.listen(PORT, () => console.log(`🌐 PWA em http://localhost:${PORT}`));
 
 iniciarWhatsApp().catch((e) => {
