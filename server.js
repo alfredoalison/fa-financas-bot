@@ -16,7 +16,7 @@ const {
   TZ_APP = 'America/Fortaleza',
   PORT = 3000,
   QR_TOKEN,
-  GEMINI_MODEL = 'gemini-2.0-flash',
+  GEMINI_MODEL = 'gemini-flash-latest,gemini-3.5-flash',
 } = process.env;
 
 for (const [k, v] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY })) {
@@ -186,26 +186,37 @@ function calcularFatura(dataISO, diaFech, diaVenc) {
 }
 
 // ---------- Gemini ----------
-async function extrairNota(buffer, mimeType, categorias) {
+async function extrairNota(buffer, mimeType, categorias, nomesUsuarios = []) {
   const prompt = `Você extrai dados de notas fiscais, cupons e comprovantes brasileiros.
 Analise o arquivo (imagem ou PDF) e responda SOMENTE com um JSON válido neste formato:
-{"estabelecimento": string, "data": "YYYY-MM-DD" ou null, "valor_total": number, "categoria": string, "itens": [{"nome_produto": string, "quantidade": number, "valor_unitario": number, "valor_total": number}]}
+{"estabelecimento": string, "data": "YYYY-MM-DD" ou null, "valor_total": number, "categoria": string, "tipo_documento": "compra" | "pix_recebido" | "pix_enviado", "itens": [{"nome_produto": string, "quantidade": number, "valor_unitario": number, "valor_total": number}]}
 Regras:
 - Números com ponto decimal, sem símbolo de moeda.
 - "categoria" deve ser exatamente uma de: ${categorias.join(' | ')}.
 - Se não houver itens legíveis, devolva "itens": [].
-- Não invente dados que não aparecem no arquivo.`;
+- Não invente dados que não aparecem no arquivo.
+- Se for comprovante de Pix ou transferência: "estabelecimento" é o nome da OUTRA parte (quem pagou, se foi recebido; quem recebeu, se foi enviado), "itens" é [] e "categoria" é "Outros".
+- "tipo_documento": "pix_recebido" se quem RECEBEU o Pix for um destes usuários: ${nomesUsuarios.join(' | ')}; "pix_enviado" se quem PAGOU for um deles. Compare só os nomes, ignorando CPF/CNPJ, números e sobrenomes a mais. Para qualquer outro documento use "compra".`;
 
-  const res = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [
-      { inlineData: { mimeType, data: buffer.toString('base64') } },
-      { text: prompt },
-    ],
-    config: { responseMimeType: 'application/json', temperature: 0 },
-  });
+  const modelos = GEMINI_MODEL.split(',').map((m) => m.trim()).filter(Boolean);
+  const contents = [{ inlineData: { mimeType, data: buffer.toString('base64') } }, { text: prompt }];
+  let res = null;
+  let ultimoErro = null;
+  for (const model of modelos) {
+    try {
+      res = await ai.models.generateContent({ model, contents, config: { responseMimeType: 'application/json' } });
+      break;
+    } catch (err) {
+      ultimoErro = err;
+      // Modelo aposentado/inexistente: tenta o próximo. Qualquer outro erro sobe direto.
+      if (!/404|not[ _]found|no longer available|not supported|deprecated|retired/i.test(String(err?.message || err))) throw err;
+      console.warn(`⚠️ Modelo ${model} indisponível, tentando o próximo...`);
+    }
+  }
+  if (!res) throw ultimoErro || new Error('nenhum modelo do Gemini disponível');
 
   const txt = (res.text || '').replace(/```json|```/g, '').trim();
+  if (!txt) throw new Error('o Gemini devolveu resposta vazia');
   const raw = JSON.parse(txt);
 
   const itens = (Array.isArray(raw.itens) ? raw.itens : []).map((i) => {
@@ -229,6 +240,7 @@ Regras:
     data,
     valor_total: +valor_total.toFixed(2),
     categoria: raw.categoria || 'Outros',
+    tipo_documento: ['pix_recebido', 'pix_enviado'].includes(raw.tipo_documento) ? raw.tipo_documento : 'compra',
     itens,
   };
 }
@@ -263,10 +275,17 @@ async function processarMidia(msg, usuario, midia, baileys) {
       supabase.from('cartoes_credito').select('*').order('nome_cartao'),
     ]);
 
-    const nota = await extrairNota(buffer, midia.mimetype, categorias.map((c) => c.nome));
+    const usuariosCadastrados = await getUsuarios();
+    const nota = await extrairNota(buffer, midia.mimetype, categorias.map((c) => c.nome), usuariosCadastrados.map((u) => u.nome));
     if (!nota.valor_total) throw new Error('valor total não identificado');
 
-    const { tipo, cartao, parcelas } = lerLegenda(midia.caption, cartoes);
+    let { tipo, cartao, parcelas } = lerLegenda(midia.caption, cartoes);
+    const legenda = norm(midia.caption);
+    if (nota.tipo_documento === 'pix_recebido' || /\b(receita|recebi|entrada)\b/.test(legenda)) {
+      tipo = 'RECEITA'; cartao = null; parcelas = 1;
+    } else if (nota.tipo_documento === 'pix_enviado' && !/\b(debito|credito|cred)\b/.test(legenda)) {
+      tipo = 'PIX'; cartao = null; parcelas = 1;
+    }
     const dataISO = nota.data || hojeLocal();
     const cat =
       categorias.find((c) => norm(c.nome) === norm(nota.categoria)) ||
@@ -276,7 +295,7 @@ async function processarMidia(msg, usuario, midia, baileys) {
     const base = {
       usuario_id: usuario.id,
       tipo_pagamento: tipo,
-      categoria_id: cat?.id || null,
+      categoria_id: tipo === 'RECEITA' ? null : cat?.id || null,
       estabelecimento: nota.estabelecimento,
       data_transacao: dataISO,
     };
@@ -315,7 +334,10 @@ async function processarMidia(msg, usuario, midia, baileys) {
     }
 
     const primeiroNome = usuario.nome.split(' ')[0];
-    let resp = `✅ Nota de R$ ${brl(nota.valor_total)} registrada para ${primeiroNome}! ${nota.itens.length} itens salvos.`;
+    let resp;
+    if (tipo === 'RECEITA') resp = `✅ Receita de R$ ${brl(nota.valor_total)} registrada para ${primeiroNome}!`;
+    else if (nota.itens.length) resp = `✅ Nota de R$ ${brl(nota.valor_total)} registrada para ${primeiroNome}! ${nota.itens.length} itens salvos.`;
+    else resp = `✅ Comprovante de R$ ${brl(nota.valor_total)} registrado para ${primeiroNome}!`;
     resp += `\n${midia.tipo === 'PDF' ? '📄 Lido de um PDF' : '🖼️ Lido de uma imagem'}`;
     resp += `\n🏪 ${nota.estabelecimento} · ${tipo}`;
     if (tipo === 'CRÉDITO' && cartao) {
@@ -325,7 +347,8 @@ async function processarMidia(msg, usuario, midia, baileys) {
     await enviar(resp, msg);
   } catch (err) {
     console.error('Erro ao processar foto:', err);
-    await enviar(`⚠️ Não consegui ler ${midia.tipo === 'PDF' ? 'esse PDF' : 'essa imagem'}. Tente outro arquivo, mais nítido e com a nota inteira, ou lance pelo app.`, msg);
+    const motivo = String(err?.message || err).replace(/\s+/g, ' ').replace(/(key=)[^&\s]+/gi, '$1***').slice(0, 160);
+    await enviar(`⚠️ Não consegui ler ${midia.tipo === 'PDF' ? 'esse PDF' : 'essa imagem'}. Tente outro arquivo, mais nítido e com a nota inteira, ou lance pelo app.\nMotivo: ${motivo}`, msg);
   }
 }
 
