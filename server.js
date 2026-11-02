@@ -500,7 +500,7 @@ const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------- API de extração (usada pela tela ESCANEAR do PWA) ----------
-// Exige o cabeçalho x-fa-token igual a API_TOKEN; CORS só para as origens de CORS_ORIGENS (separadas por vírgula).
+// Exige o cabeçalho Authorization: Bearer <API_TOKEN> (ou x-fa-token); CORS só para as origens de CORS_ORIGENS (separadas por vírgula).
 const API_TOKEN = process.env.API_TOKEN || '';
 const CORS_ORIGENS = (process.env.CORS_ORIGENS || '').split(',').map((o) => o.trim()).filter(Boolean);
 const MIMES_OK = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf']);
@@ -512,7 +512,7 @@ app.use('/api', (req, res, next) => {
     res.set({
       'Access-Control-Allow-Origin': origin,
       Vary: 'Origin',
-      'Access-Control-Allow-Headers': 'Content-Type, x-fa-token',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-fa-token',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
     });
   }
@@ -521,7 +521,8 @@ app.use('/api', (req, res, next) => {
 });
 
 app.post('/api/extrair', express.json({ limit: '25mb' }), async (req, res) => {
-  if (!API_TOKEN || req.get('x-fa-token') !== API_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
+  const enviado = (req.get('authorization') || '').replace(/^Bearer\s+/i, '') || req.get('x-fa-token') || '';
+  if (!API_TOKEN || enviado !== API_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
   if (extraindo >= 3) return res.status(429).json({ erro: 'Muitas leituras ao mesmo tempo. Tente de novo em instantes.' });
   const { mime, data } = req.body || {};
   if (!MIMES_OK.has(mime) || typeof data !== 'string') return res.status(400).json({ erro: 'Arquivo inválido.' });
