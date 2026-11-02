@@ -35,6 +35,18 @@ let groupJid = null;
 let currentQR = null; // último QR gerado pelo Baileys (null quando não há pareamento pendente)
 let whatsappConectado = false;
 
+// Envia ao grupo sem nunca lançar erro: falha de criptografia (ex.: "No sessions")
+// não pode derrubar o processamento nem gerar um aviso falso de "não consegui ler".
+async function enviar(texto, quoted) {
+  try {
+    await sock.sendMessage(groupJid, { text: texto }, quoted ? { quoted } : undefined);
+    return true;
+  } catch (err) {
+    console.error('⚠️ Não consegui enviar mensagem ao grupo:', err?.message || err);
+    return false;
+  }
+}
+
 // ---------- utilidades ----------
 const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 const brl = (v) => Number(v || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -310,14 +322,10 @@ async function processarMidia(msg, usuario, midia, baileys) {
       const [fy, fm] = rows[0].fatura_mes_ano.split('-');
       resp += ` · ${cartao.nome_cartao}${parcelas > 1 ? ` ${parcelas}x` : ''} (fatura ${fm}/${fy})`;
     }
-    await sock.sendMessage(groupJid, { text: resp }, { quoted: msg });
+    await enviar(resp, msg);
   } catch (err) {
     console.error('Erro ao processar foto:', err);
-    await sock.sendMessage(
-      groupJid,
-      { text: `⚠️ Não consegui ler ${midia.tipo === 'PDF' ? 'esse PDF' : 'essa imagem'}. Tente outro arquivo, mais nítido e com a nota inteira, ou lance pelo app.` },
-      { quoted: msg }
-    );
+    await enviar(`⚠️ Não consegui ler ${midia.tipo === 'PDF' ? 'esse PDF' : 'essa imagem'}. Tente outro arquivo, mais nítido e com a nota inteira, ou lance pelo app.`, msg);
   }
 }
 
@@ -409,13 +417,13 @@ async function iniciarWhatsApp() {
         if (reivindicacao) {
           const alvo = usuarios.find((u) => norm(u.nome).split(' ')[0] === reivindicacao[1]);
           if (!alvo) {
-            await sock.sendMessage(groupJid, { text: `Não conheço "${reivindicacao[1]}". Responda ${nomes}.` }, { quoted: msg });
+            await enviar(`Não conheço "${reivindicacao[1]}". Responda ${nomes}.`, msg);
             continue;
           }
           lidUsuario.set(lidKey(lid), alvo.id);
           const { error } = await supabase.from('lid_usuarios').upsert({ lid: lidKey(lid), usuario_id: alvo.id });
           if (error) console.log('⚠️ Vínculo não salvo no banco (vale só até reiniciar):', error.message);
-          await sock.sendMessage(groupJid, { text: `✅ Combinado, ${alvo.nome.split(' ')[0]}! Guardei seu ID, não precisa repetir.` }, { quoted: msg });
+          await enviar(`✅ Combinado, ${alvo.nome.split(' ')[0]}! Guardei seu ID, não precisa repetir.`, msg);
           const pend = pendentes.get(lidKey(lid));
           if (pend) {
             pendentes.delete(lidKey(lid));
@@ -428,11 +436,7 @@ async function iniciarWhatsApp() {
         const jaPediu = pendentes.has(lidKey(lid));
         pendentes.set(lidKey(lid), { msg, midia });
         if (!jaPediu) {
-          await sock.sendMessage(
-            groupJid,
-            { text: `👋 Não consegui identificar quem enviou esse arquivo. Responda ${nomes} que eu registro agora (só precisa fazer isso uma vez).` },
-            { quoted: msg }
-          );
+          await enviar(`👋 Não consegui identificar quem enviou esse arquivo. Responda ${nomes} que eu registro agora (só precisa fazer isso uma vez).`, msg);
         }
       } catch (err) {
         console.error('Erro na mensagem:', err);
@@ -460,7 +464,7 @@ async function enviarResumoDiario() {
     const linhas = usuarios.map((u) => `👤 ${u.nome.split(' ')[0]}: R$ ${brl(totais[u.id] || 0)}`);
     const total = Object.values(totais).reduce((s, v) => s + v, 0);
     const texto = `📊 RESUMO DO DIA - F&A FINANÇAS\n---\n${linhas.join('\n')}\n💰 Total do Dia: R$ ${brl(total)}`;
-    await sock.sendMessage(groupJid, { text: texto });
+    await enviar(texto);
   } catch (err) {
     console.error('Erro no resumo diário:', err);
   }
