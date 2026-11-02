@@ -16,6 +16,7 @@ const {
   TZ_APP = 'America/Fortaleza',
   PORT = 3000,
   QR_TOKEN,
+  GEMINI_MODEL = 'gemini-2.0-flash',
 } = process.env;
 
 for (const [k, v] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GEMINI_API_KEY })) {
@@ -38,6 +39,80 @@ let whatsappConectado = false;
 const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 const brl = (v) => Number(v || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const phoneOf = (jid) => String(jid || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+
+// Chave de comparação de telefone: DDD + últimos 8 dígitos. Ignora o 55 e o 9º dígito,
+// que o WhatsApp às vezes omite em números brasileiros (5584981767874 x 558481767874).
+function phoneKey(v) {
+  let d = String(v || '').replace(/\D/g, '');
+  if (d.startsWith('55') && d.length >= 12) d = d.slice(2);
+  return d.length >= 10 ? d.slice(0, 2) + d.slice(-8) : d;
+}
+
+// ---- Identificação do remetente quando o WhatsApp envia "xxx@lid" ----
+const isLid = (jid) => String(jid || '').endsWith('@lid');
+const lidKey = (jid) => `${phoneOf(jid)}@lid`; // remove sufixo de dispositivo (":12")
+const lidParaTelefone = new Map(); // "123456@lid" -> "5584981767874"
+
+// Mapeamento manual opcional (último recurso): LID_MAP="111@lid=5584981767874,222@lid=5584986250294"
+for (const par of (process.env.LID_MAP || '').split(',')) {
+  const [lid, tel] = par.split('=').map((x) => x && x.trim());
+  if (lid && tel) lidParaTelefone.set(lidKey(lid), tel.replace(/\D/g, ''));
+}
+
+// Aprende LID -> telefone a partir da lista de participantes do grupo.
+// Baileys 7.x: { id: "xxx@lid", phoneNumber: "55...@s.whatsapp.net" }; 6.x: { id: "55...@s.whatsapp.net", lid: "xxx@lid" }.
+function guardarParticipantes(participants = []) {
+  for (const p of participants) {
+    const ids = [p.id, p.lid, p.phoneNumber, p.jid].filter(Boolean).map(String);
+    const lid = ids.find(isLid);
+    const pn = ids.find((x) => x.endsWith('@s.whatsapp.net'));
+    if (lid && pn) lidParaTelefone.set(lidKey(lid), phoneOf(pn));
+  }
+}
+
+// Devolve o telefone real (só dígitos) de quem enviou a mensagem, ou null.
+async function resolverRemetente(msg) {
+  const k = msg.key;
+  if (k.fromMe) return phoneOf(sock.user?.id); // bot pareado no número de um dos dois
+
+  const candidatos = [k.participantPn, k.participantAlt, k.senderPn, msg.participant, k.participant].filter(Boolean);
+
+  // 1) o número real já veio na mensagem
+  const pn = candidatos.find((j) => String(j).endsWith('@s.whatsapp.net'));
+  if (pn) return phoneOf(pn);
+
+  // 2) veio como @lid: cache -> mapeamento interno do Baileys -> metadados do grupo
+  const lid = candidatos.find(isLid);
+  if (!lid) return null;
+  if (lidParaTelefone.has(lidKey(lid))) return lidParaTelefone.get(lidKey(lid));
+
+  try {
+    const viaBaileys = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
+    if (viaBaileys) {
+      lidParaTelefone.set(lidKey(lid), phoneOf(viaBaileys));
+      return phoneOf(viaBaileys);
+    }
+  } catch (_) { /* versão sem lidMapping */ }
+
+  try {
+    const meta = await sock.groupMetadata(groupJid);
+    guardarParticipantes(meta.participants);
+  } catch (_) { /* segue para o fallback */ }
+
+  return lidParaTelefone.get(lidKey(lid)) || null;
+}
+
+// Aceita imagem e PDF. Devolve null para qualquer outro tipo de mensagem.
+const MAX_MIDIA = 18 * 1024 * 1024; // limite prático para enviar inline ao Gemini
+function extrairMidia(content) {
+  const img = content?.imageMessage;
+  if (img) return { tipo: 'imagem', mimetype: img.mimetype || 'image/jpeg', caption: img.caption || '' };
+  const doc = content?.documentMessage;
+  if (doc && String(doc.mimetype || '').toLowerCase().startsWith('application/pdf')) {
+    return { tipo: 'PDF', mimetype: 'application/pdf', caption: doc.caption || '' };
+  }
+  return null;
+}
 const hojeLocal = () => new Date().toLocaleDateString('en-CA', { timeZone: TZ_APP });
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -71,16 +146,16 @@ function calcularFatura(dataISO, diaFech, diaVenc) {
 // ---------- Gemini ----------
 async function extrairNota(buffer, mimeType, categorias) {
   const prompt = `Você extrai dados de notas fiscais, cupons e comprovantes brasileiros.
-Analise a imagem e responda SOMENTE com um JSON válido neste formato:
+Analise o arquivo (imagem ou PDF) e responda SOMENTE com um JSON válido neste formato:
 {"estabelecimento": string, "data": "YYYY-MM-DD" ou null, "valor_total": number, "categoria": string, "itens": [{"nome_produto": string, "quantidade": number, "valor_unitario": number, "valor_total": number}]}
 Regras:
 - Números com ponto decimal, sem símbolo de moeda.
 - "categoria" deve ser exatamente uma de: ${categorias.join(' | ')}.
 - Se não houver itens legíveis, devolva "itens": [].
-- Não invente dados que não aparecem na imagem.`;
+- Não invente dados que não aparecem no arquivo.`;
 
   const res = await ai.models.generateContent({
-    model: 'gemini-2.0-flash',
+    model: GEMINI_MODEL,
     contents: [
       { inlineData: { mimeType, data: buffer.toString('base64') } },
       { text: prompt },
@@ -134,24 +209,22 @@ function lerLegenda(caption, cartoes) {
 }
 
 // ---------- processamento de foto ----------
-async function processarFoto(msg, usuario, baileys) {
-  const { downloadMediaMessage, normalizeMessageContent } = baileys;
-  const content = normalizeMessageContent(msg.message);
-  const img = content?.imageMessage;
-  if (!img) return;
+async function processarMidia(msg, usuario, midia, baileys) {
+  const { downloadMediaMessage } = baileys;
 
   try {
     const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+    if (buffer.length > MAX_MIDIA) throw new Error('arquivo muito grande');
 
     const [{ data: categorias }, { data: cartoes }] = await Promise.all([
       supabase.from('categorias').select('id,nome'),
       supabase.from('cartoes_credito').select('*').order('nome_cartao'),
     ]);
 
-    const nota = await extrairNota(buffer, img.mimetype || 'image/jpeg', categorias.map((c) => c.nome));
+    const nota = await extrairNota(buffer, midia.mimetype, categorias.map((c) => c.nome));
     if (!nota.valor_total) throw new Error('valor total não identificado');
 
-    const { tipo, cartao, parcelas } = lerLegenda(img.caption || '', cartoes);
+    const { tipo, cartao, parcelas } = lerLegenda(midia.caption, cartoes);
     const dataISO = nota.data || hojeLocal();
     const cat =
       categorias.find((c) => norm(c.nome) === norm(nota.categoria)) ||
@@ -201,6 +274,7 @@ async function processarFoto(msg, usuario, baileys) {
 
     const primeiroNome = usuario.nome.split(' ')[0];
     let resp = `✅ Nota de R$ ${brl(nota.valor_total)} registrada para ${primeiroNome}! ${nota.itens.length} itens salvos.`;
+    resp += `\n${midia.tipo === 'PDF' ? '📄 Lido de um PDF' : '🖼️ Lido de uma imagem'}`;
     resp += `\n🏪 ${nota.estabelecimento} · ${tipo}`;
     if (tipo === 'CRÉDITO' && cartao) {
       const [fy, fm] = rows[0].fatura_mes_ano.split('-');
@@ -211,7 +285,7 @@ async function processarFoto(msg, usuario, baileys) {
     console.error('Erro ao processar foto:', err);
     await sock.sendMessage(
       groupJid,
-      { text: '⚠️ Não consegui ler essa nota. Tente outra foto, mais nítida e com o cupom inteiro, ou lance pelo app.' },
+      { text: `⚠️ Não consegui ler ${midia.tipo === 'PDF' ? 'esse PDF' : 'essa imagem'}. Tente outro arquivo, mais nítido e com a nota inteira, ou lance pelo app.` },
       { quoted: msg }
     );
   }
@@ -221,7 +295,10 @@ async function processarFoto(msg, usuario, baileys) {
 async function resolverGrupo() {
   const grupos = await sock.groupFetchAllParticipating();
   const g = Object.values(grupos).find((x) => norm(x.subject) === norm(WHATSAPP_GROUP_NAME));
-  if (g) groupJid = g.id;
+  if (g) {
+    groupJid = g.id;
+    guardarParticipantes(g.participants);
+  }
   return groupJid;
 }
 
@@ -273,19 +350,26 @@ async function iniciarWhatsApp() {
         if (jid !== groupJid) continue;
 
         const content = baileys.normalizeMessageContent(msg.message);
-        if (!content?.imageMessage) continue;
+        const midia = extrairMidia(content);
+        if (!midia) continue;
 
-        // Se o bot está pareado no número de um dos dois, a mensagem vem como fromMe.
-        const remetente = msg.key.fromMe ? sock.user?.id : msg.key.participantPn || msg.key.participant;
-        const tel = phoneOf(remetente);
-
-        const { data: usuarios } = await supabase.from('usuarios').select('*');
-        const usuario = usuarios?.find((u) => phoneOf(u.telefone_whatsapp) === tel);
-        if (!usuario) {
-          console.log(`Foto ignorada: remetente ${remetente} não está cadastrado.`);
+        const tel = await resolverRemetente(msg);
+        if (!tel) {
+          console.log('Mídia ignorada: não foi possível descobrir o telefone do remetente.', {
+            participant: msg.key.participant,
+            participantPn: msg.key.participantPn,
+            participantAlt: msg.key.participantAlt,
+          });
           continue;
         }
-        await processarFoto(msg, usuario, baileys);
+
+        const { data: usuarios } = await supabase.from('usuarios').select('*');
+        const usuario = usuarios?.find((u) => phoneKey(u.telefone_whatsapp) === phoneKey(tel));
+        if (!usuario) {
+          console.log(`Mídia ignorada: telefone ${tel} não está cadastrado.`);
+          continue;
+        }
+        await processarMidia(msg, usuario, midia, baileys);
       } catch (err) {
         console.error('Erro na mensagem:', err);
       }
