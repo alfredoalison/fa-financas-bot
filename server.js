@@ -499,6 +499,52 @@ cron.schedule('0 21 * * *', enviarResumoDiario, { timezone: TZ_APP });
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ---------- API de extração (usada pela tela ESCANEAR do PWA) ----------
+// Exige o cabeçalho x-fa-token igual a API_TOKEN; CORS só para as origens de CORS_ORIGENS (separadas por vírgula).
+const API_TOKEN = process.env.API_TOKEN || '';
+const CORS_ORIGENS = (process.env.CORS_ORIGENS || '').split(',').map((o) => o.trim()).filter(Boolean);
+const MIMES_OK = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif', 'application/pdf']);
+let extraindo = 0;
+
+app.use('/api', (req, res, next) => {
+  const origin = req.get('origin');
+  if (origin && CORS_ORIGENS.includes(origin)) {
+    res.set({
+      'Access-Control-Allow-Origin': origin,
+      Vary: 'Origin',
+      'Access-Control-Allow-Headers': 'Content-Type, x-fa-token',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    });
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+app.post('/api/extrair', express.json({ limit: '25mb' }), async (req, res) => {
+  if (!API_TOKEN || req.get('x-fa-token') !== API_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
+  if (extraindo >= 3) return res.status(429).json({ erro: 'Muitas leituras ao mesmo tempo. Tente de novo em instantes.' });
+  const { mime, data } = req.body || {};
+  if (!MIMES_OK.has(mime) || typeof data !== 'string') return res.status(400).json({ erro: 'Arquivo inválido.' });
+  extraindo++;
+  try {
+    const buffer = Buffer.from(data, 'base64');
+    if (!buffer.length) return res.status(400).json({ erro: 'Arquivo vazio.' });
+    if (buffer.length > MAX_MIDIA) return res.status(413).json({ erro: 'Arquivo muito grande.' });
+    const [{ data: categorias }, usuarios] = await Promise.all([
+      supabase.from('categorias').select('nome'),
+      getUsuarios(),
+    ]);
+    const nota = await extrairNota(buffer, mime, (categorias || []).map((c) => c.nome), usuarios.map((u) => u.nome));
+    if (!nota.valor_total) return res.status(422).json({ erro: 'Não consegui identificar o valor total. Tire outra foto mais nítida.' });
+    res.json(nota);
+  } catch (err) {
+    console.error('Erro em /api/extrair:', err);
+    res.status(500).json({ erro: 'Falha ao ler a nota. Tente outra foto.' });
+  } finally {
+    extraindo--;
+  }
+});
+
 // Página com o QR Code de pareamento do WhatsApp (atualiza sozinha a cada 5 s).
 // Se QR_TOKEN estiver definido no ambiente, acesse /qr?token=SEU_TOKEN.
 app.get('/qr', async (req, res) => {
